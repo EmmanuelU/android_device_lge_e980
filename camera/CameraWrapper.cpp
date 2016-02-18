@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012-2014, The CyanogenMod Project
+ * Copyright (C) 2012-2016, The CyanogenMod Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,6 +38,8 @@
 static android::Mutex gCameraWrapperLock;
 static camera_module_t *gVendorModule = 0;
 
+static char **fixed_set_params = NULL;
+
 static int camera_device_open(const hw_module_t* module, const char *name,
                 hw_device_t **device);
 static int camera_device_close(hw_device_t* device);
@@ -65,8 +67,6 @@ camera_module_t HAL_MODULE_INFO_SYM = {
     .set_callbacks = NULL, /* remove compilation warnings */
     .get_vendor_tag_ops = NULL, /* remove compilation warnings */
     .open_legacy = NULL, /* remove compilation warnings */
-    .set_torch_mode = NULL, /* remove compilation warnings */
-    .init = NULL, /* remove compilation warnings */
     .reserved = {0}, /* remove compilation warnings */
 };
 
@@ -81,9 +81,6 @@ typedef struct wrapper_camera_device {
     __wrapper_dev->vendor->ops->func(__wrapper_dev->vendor, ##__VA_ARGS__); \
 })
 
-static bool flipZsl = false;
-static bool zslState = false;
-static bool previewRunning = false;
 camera_data_callback sDataCb;
 
 #define CAMERA_ID(device) (((wrapper_camera_device_t *)(device))->id)
@@ -129,28 +126,6 @@ static char * camera_fixup_getparams(int id, const char * settings)
     params.set(android::CameraParameters::KEY_MAX_NUM_DETECTED_FACES_HW, "off");
     params.set(android::CameraParameters::KEY_MAX_NUM_DETECTED_FACES_SW, "off");
 
-    /* Set supported scene modes */
-    if (id == 0) {
-        if (!videoMode) {
-            manipBuf = strdup(params.get(android::CameraParameters::KEY_SUPPORTED_SCENE_MODES));
-            if (manipBuf != NULL && strstr(manipBuf,"hdr") == NULL) {
-                char *scenes = (char *)malloc(strlen(manipBuf)+4);
-                sprintf(scenes, "hdr,%s", manipBuf);
-                params.set(android::CameraParameters::KEY_SUPPORTED_SCENE_MODES,
-                        scenes);
-                free(scenes);
-            }
-            free(manipBuf);
-        }
-    }
-
-    /* LIE! The camera will set 3 snaps when doing HDR, and only return one. This hangs apps
-     * that wait for the rest to come in. Make sure we never return multiple snaps unless
-     * doing ZSL */
-    if (!videoMode && (!params.get("zsl") || strncmp(params.get("zsl"),"on", 2))) {
-        params.set("num-snaps-per-shutter", "1");
-    }
-
     ALOGV("%s: fixed parameters:", __func__);
     //params.dump();
 
@@ -177,30 +152,14 @@ char * camera_fixup_setparams(int id, const char * settings)
         videoMode = (!strcmp(params.get(android::CameraParameters::KEY_RECORDING_HINT), "true"));
     }
 
-    if (id == 0) {
-        if (!videoMode && !strncmp(params.get(android::CameraParameters::KEY_SCENE_MODE),"hdr",3)) {
-            params.set("hdr-mode", "1");
-        } else {
-            params.set("hdr-mode", "0");
-        }
-
-        if (!strcmp(params.get("zsl"), "on")) {
-            if (previewRunning && !zslState) { flipZsl = true; }
-            zslState = true;
-            params.set("camera-mode", "1");
-        } else {
-            if (previewRunning && zslState) { flipZsl = true; }
-            zslState = false;
-            params.set("camera-mode", "0");
-        }
-    }
-
-
     ALOGV("%s: fixed parameters:", __func__);
     //params.dump();
 
     android::String8 strParams = params.flatten();
-    char *ret = strdup(strParams.string());
+    if (fixed_set_params[id])
+        free(fixed_set_params[id]);
+    fixed_set_params[id] = strdup(strParams.string());
+    char *ret = fixed_set_params[id];
 
     return ret;
 }
@@ -279,7 +238,6 @@ int camera_start_preview(struct camera_device * device)
         return -EINVAL;
 
     rc = VENDOR_CALL(device, start_preview);
-    previewRunning = (rc == android::NO_ERROR);
     return rc;
 }
 
@@ -291,7 +249,6 @@ void camera_stop_preview(struct camera_device * device)
     if (!device)
         return;
 
-    previewRunning = false;
     VENDOR_CALL(device, stop_preview);
 }
 
@@ -423,14 +380,7 @@ int camera_set_parameters(struct camera_device * device, const char *params)
     __android_log_write(ANDROID_LOG_VERBOSE, LOG_TAG, tmp);
 #endif
 
-    if (flipZsl) {
-        camera_stop_preview(device);
-    }
     int ret = VENDOR_CALL(device, set_parameters, tmp);
-    if (flipZsl) {
-        camera_start_preview(device);
-        flipZsl = false;
-    }
     return ret;
 }
 
@@ -515,6 +465,11 @@ int camera_device_close(hw_device_t* device)
         goto done;
     }
 
+    for (int i = 0; i < camera_get_number_of_cameras(); i++) {
+        if (fixed_set_params[i])
+            free(fixed_set_params[i]);
+    }
+
     wrapper_dev = (wrapper_camera_device_t*) device;
 
     wrapper_dev->vendor->common.close((hw_device_t*)wrapper_dev->vendor);
@@ -558,6 +513,14 @@ int camera_device_open(const hw_module_t* module, const char* name,
         cameraid = atoi(name);
         num_cameras = gVendorModule->get_number_of_cameras();
 
+        fixed_set_params = (char **) malloc(sizeof(char *) * num_cameras);
+        if (!fixed_set_params) {
+            ALOGE("parameter memory allocation fail");
+            rv = -ENOMEM;
+            goto fail;
+        }
+        memset(fixed_set_params, 0, sizeof(char *) * num_cameras);
+
         if (cameraid > num_cameras) {
             ALOGE("camera service provided cameraid out of bounds, "
                     "cameraid = %d, num supported = %d",
@@ -591,7 +554,7 @@ int camera_device_open(const hw_module_t* module, const char* name,
         memset(camera_ops, 0, sizeof(*camera_ops));
 
         camera_device->base.common.tag = HARDWARE_DEVICE_TAG;
-        camera_device->base.common.version = CAMERA_DEVICE_API_VERSION_1_0;
+        camera_device->base.common.version = HARDWARE_DEVICE_API_VERSION(1, 0);
         camera_device->base.common.module = (hw_module_t *)(module);
         camera_device->base.common.close = camera_device_close;
         camera_device->base.ops = camera_ops;
